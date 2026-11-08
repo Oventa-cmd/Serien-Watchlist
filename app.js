@@ -23,6 +23,8 @@ const S = {
   recs: null, recsSig: null, recsPromise: null,
   trending: null,
   search: { q: '', results: null, loading: false, seq: 0 },
+  disc: { type: 'tv', fam: null, sort: 'pop', page: 0, results: [], done: false, loading: false, seq: 0 },
+  rows: new Map(), logos: new Map(), provCat: null, heroCache: null, heroSig: null, heroIdx: 0,
   lastSync: 0, sortables: [], navigated: false,
 };
 const timers = new Map();
@@ -310,7 +312,7 @@ async function saveKey(k) {
   const { error } = await S.sb.from('settings').upsert({ user_id: S.user.id, tmdb_key: k, updated_at: new Date().toISOString() });
   if (error) throw new Error('Speichern fehlgeschlagen: ' + error.message);
   S.tmdbKey = k; lsSet('an_tmdb_' + S.user.id, k);
-  tmdbCache.clear(); S.recs = null; S.recsSig = null; S.trending = null;
+  tmdbCache.clear(); S.recs = null; S.recsSig = null; S.rows.clear(); S.heroCache = null; S.heroSig = null; S.provCat = null;
 }
 
 /* ---------- Gates (Login, Setup) ---------- */
@@ -419,6 +421,7 @@ const NAV = [
 
 function renderShell() {
   $('#app').innerHTML = `
+  <div id="ambient" aria-hidden="true"></div>
   <header class="topbar">
     <a class="brand" href="#/home">${bulbs(3)}Als Nächstes</a>
     <nav class="nav" aria-label="Hauptnavigation">${NAV.map(n => `<a href="#/${n.id}" data-nav="${n.id}">${n.icon}${n.label}</a>`).join('')}</nav>
@@ -451,6 +454,7 @@ function route() {
   document.querySelectorAll('[data-nav]').forEach(a => { if (a.dataset.nav === r.view) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   const changed = S.curView !== r.view;
   S.curView = r.view;
+  if (changed) { clearInterval(heroTimer); if (r.view !== 'home') setAmbient(null); }
   renderView(changed);
   if (changed) window.scrollTo(0, 0);
   if (r.view === 'discover' && r.query === 'suche') setTimeout(() => $('#q')?.focus(), 30);
@@ -493,8 +497,8 @@ function posterCard(c, opt = {}) {
       ${!inList && !opt.noAdd ? `<button class="quickadd" data-add="${type}:${id}" aria-label="„${esc(t)}“ auf die Liste setzen" title="Auf die Liste">${I.plus}</button>` : ''}
     </div>
     <a class="t" href="#/${type}/${id}">${esc(t)}</a>
-    <div class="s">${typeLabel(type)}${yr ? ' · ' + yr : ''}</div>
-    ${opt.reason ? `<div class="reason">${esc(opt.reason)}</div>` : ''}
+    <div class="s">${typeLabel(type)}${yr ? ' · ' + yr : ''}${c.vote_count > 30 && c.vote_average ? ` · <span class="vote">★ ${fmtNum(c.vote_average)}</span>` : ''}</div>
+    ${opt.reason ? `<div class="reason">${opt.match ? `<b class="match">${opt.match} %</b> ` : ''}${esc(opt.reason)}</div>` : ''}
   </div>`;
 }
 
@@ -551,56 +555,103 @@ function sectionHead(title, sub, link) {
   return `<div class="section-head"><div><h2>${title}</h2>${sub ? `<div class="sub">${sub}</div>` : ''}</div>${link || ''}</div>`;
 }
 
-/* ---------- Start ---------- */
-function renderHome(v) {
-  const all = [...S.items.values()];
-  const watching = inStatus('watching');
-  const planned = inStatus('planned');
-  const next = watching[0] || planned[0];
-  let html = '';
-  if (!all.length) {
-    html += `<section class="hero" style="min-height:auto"><div class="content" style="padding-block:clamp(28px,5vw,56px)">
-      <div class="eyebrow">${bulbs(3)}Willkommen</div>
-      <h1 class="title-fallback">Was guckst<br>du als Nächstes?</h1>
-      <p class="overview" style="color:var(--muted)">Such Serien und Filme, setz sie auf deine Liste und bring sie in deine Reihenfolge. Je mehr du hinzufügst und bewertest, desto besser werden die Empfehlungen.</p>
-      <div class="actions"><a class="btn primary" href="#/discover?suche">${I.search}Titel suchen</a></div>
-    </div></section>`;
-  } else if (next) {
-    html += heroHTML(next);
-  }
-  if (watching.length) {
-    html += `<section class="section">${sectionHead('Am Gucken', `${watching.length} ${watching.length === 1 ? 'Titel' : 'Titel'}`)}
-      <div class="row wide">${watching.map(watchCard).join('')}</div></section>`;
-  }
-  if (planned.length) {
-    html += `<section class="section">${sectionHead('Warteschlange', 'In deiner Reihenfolge', '<a href="#/list">Reihenfolge ändern →</a>')}
-      <div class="row posters">${planned.map((it, i) => posterCard({ ...it, id: it.tmdb_id }, { rank: i + 1 })).join('')}</div></section>`;
-  }
-  if (all.length) {
-    html += `<section class="section">${sectionHead('Für dich', 'Aus deiner Liste und deinen Bewertungen', '<a href="#/discover">Mehr →</a>')}
-      <div class="row posters" id="home-recs">${skeletons(7)}</div></section>`;
-  }
-  html += `<section class="section">${sectionHead('Trends diese Woche')}
-    <div class="row posters" id="home-trending">${skeletons(7)}</div></section>`;
-  html += credit();
-  v.innerHTML = html;
-  if (all.length) fillRecs($('#home-recs'), 18, true);
-  fillTrending($('#home-trending'));
+/* ---------- Geschmack: Genres, Dienste, Ausgeblendet ---------- */
+const FAMS = [
+  { id: 'action',  label: 'Action & Abenteuer', movie: [28, 12], tv: [10759], names: ['Action', 'Abenteuer', 'Action & Adventure'] },
+  { id: 'crime',   label: 'Krimi',              movie: [80],     tv: [80],    names: ['Krimi'] },
+  { id: 'drama',   label: 'Drama',              movie: [18],     tv: [18],    names: ['Drama'] },
+  { id: 'comedy',  label: 'Komödie',            movie: [35],     tv: [35],    names: ['Komödie'] },
+  { id: 'scifi',   label: 'Sci-Fi & Fantasy',   movie: [878, 14], tv: [10765], names: ['Science Fiction', 'Fantasy', 'Sci-Fi & Fantasy'] },
+  { id: 'thriller',label: 'Thriller',           movie: [53],     tv: [],      names: ['Thriller'] },
+  { id: 'mystery', label: 'Mystery',            movie: [9648],   tv: [9648],  names: ['Mystery'] },
+  { id: 'horror',  label: 'Horror',             movie: [27],     tv: [],      names: ['Horror'] },
+  { id: 'anim',    label: 'Animation',          movie: [16],     tv: [16],    names: ['Animation'] },
+  { id: 'doc',     label: 'Dokus',              movie: [99],     tv: [99],    names: ['Dokumentarfilm', 'Dokumentation'] },
+  { id: 'romance', label: 'Romantik',           movie: [10749],  tv: [],      names: ['Liebesfilm', 'Romantik'] },
+  { id: 'war',     label: 'Krieg & Politik',    movie: [10752],  tv: [10768], names: ['Kriegsfilm', 'War & Politics', 'Krieg & Politik'] },
+  { id: 'history', label: 'Historie',           movie: [36],     tv: [],      names: ['Historie'] },
+  { id: 'family',  label: 'Familie',            movie: [10751],  tv: [10751, 10762], names: ['Familie', 'Kids'] },
+  { id: 'reality', label: 'Reality',            movie: [],       tv: [10764], names: ['Reality'] },
+  { id: 'western', label: 'Western',            movie: [37],     tv: [37],    names: ['Western'] },
+];
+const FAM = Object.fromEntries(FAMS.map(f => [f.id, f]));
+const famByName = new Map(FAMS.flatMap(f => f.names.map(n => [n, f.id])));
+const famById = { movie: new Map(), tv: new Map() };
+FAMS.forEach(f => { f.movie.forEach(g => famById.movie.set(g, f.id)); f.tv.forEach(g => famById.tv.set(g, f.id)); });
+const famsOf = c => [...new Set((c.genre_ids || []).map(g => famById[c.media_type]?.get(g)).filter(Boolean))];
+
+const uKey = k => 'an_' + k + '_' + (S.user?.id || '');
+function hiddenSet() { try { return new Set(JSON.parse(lsGet(uKey('hide')) || '[]')); } catch { return new Set(); } }
+function hideTitle(k) { const h = hiddenSet(); h.add(k); lsSet(uKey('hide'), JSON.stringify([...h])); S.recs = null; S.recsSig = null; S.rows.clear(); }
+const isHidden = (c, h = hiddenSet()) => h.has(key(c.media_type, c.id ?? c.tmdb_id));
+
+function itemWeight(it) {
+  const base = { done: 0.8, watching: 1, planned: 0.5, dropped: -0.8 };
+  return it.rating ? (it.rating - 5) / 2.5 : base[it.status] ?? 0.4;
 }
 
-const skeletons = n => Array.from({ length: n }, () => '<div class="pcard"><div class="skeleton" style="aspect-ratio:2/3"></div></div>').join('');
-const credit = () => `<footer class="credit">Daten und Bilder: TMDB. Diese App nutzt die TMDB-API, ist aber nicht von TMDB unterstützt oder zertifiziert. Streaming-Daten: JustWatch.</footer>`;
-
-async function fillTrending(el) {
-  try {
-    if (!S.trending) S.trending = (await tmdb('/trending/all/week')).results.filter(r => r.media_type === 'tv' || r.media_type === 'movie');
-    if (el.isConnected) el.innerHTML = S.trending.map(c => posterCard(c)).join('');
-  } catch (e) { if (el.isConnected) el.outerHTML = `<p class="err">${esc(e.message)}</p>`; }
+/* Genre-Profil aus Liste + Bewertungen */
+function tasteProfile() {
+  const w = new Map();
+  for (const it of S.items.values()) {
+    const iw = itemWeight(it);
+    const fams = [...new Set((it.meta?.genres || []).map(n => famByName.get(n)).filter(Boolean))];
+    fams.forEach(f => w.set(f, (w.get(f) || 0) + iw / Math.sqrt(fams.length)));
+  }
+  const max = Math.max(1e-6, ...[...w.values()].map(Math.abs));
+  const norm = new Map([...w].map(([f, v]) => [f, v / max]));
+  const top = [...norm].filter(([, v]) => v > 0.15).sort((a, b) => b[1] - a[1]).map(([f]) => f);
+  return { w: norm, top };
 }
+
+/* Streamingdienste in DE */
+async function providerCatalog() {
+  if (S.provCat) return S.provCat;
+  const [a, b] = await Promise.all([
+    tmdb('/watch/providers/tv', { watch_region: 'DE' }).catch(() => ({ results: [] })),
+    tmdb('/watch/providers/movie', { watch_region: 'DE' }).catch(() => ({ results: [] })),
+  ]);
+  const m = new Map();
+  [...a.results, ...b.results].forEach(p => {
+    const prio = p.display_priorities?.DE ?? p.display_priority ?? 99;
+    const cur = m.get(p.provider_id);
+    if (!cur || prio < cur.prio) m.set(p.provider_id, { id: p.provider_id, n: p.provider_name, l: p.logo_path, prio });
+  });
+  S.provCat = [...m.values()].sort((x, y) => x.prio - y.prio);
+  return S.provCat;
+}
+async function myProviders() {
+  const cat = await providerCatalog();
+  let chosen = null;
+  try { chosen = JSON.parse(lsGet(uKey('prov')) || 'null'); } catch {}
+  if (Array.isArray(chosen) && chosen.length) return cat.filter(p => chosen.includes(p.id));
+  const cnt = new Map();
+  for (const it of S.items.values()) (it.meta?.prov || []).forEach(p => cnt.set(p.n, (cnt.get(p.n) || 0) + (it.status === 'dropped' ? 0 : 1)));
+  return [...cnt].filter(([, n]) => n > 0).sort((a, b) => b[1] - a[1]).slice(0, 4)
+    .map(([n]) => cat.find(p => p.n === n)).filter(Boolean);
+}
+
+/* Täglich wechselnde, aber stabile Auswahl */
+function dayPick(salt, n) {
+  let h = 2166136261;
+  for (const ch of today() + salt) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+  return (Math.abs(h) % n) + 1;
+}
+const interleave = (...lists) => { const out = []; const m = Math.max(0, ...lists.map(l => l.length)); for (let i = 0; i < m; i++) lists.forEach(l => l[i] && out.push(l[i])); return out; };
+const tag = (type) => r => (r.results || []).map(c => ({ ...c, media_type: c.media_type || type }));
+function disc(type, params = {}) {
+  return tmdb(`/discover/${type}`, { watch_region: 'DE', sort_by: 'popularity.desc', 'vote_count.gte': 80, include_adult: 'false', ...params }).then(tag(type));
+}
+function famParams(type, fams) {
+  const ids = [...new Set(fams.flatMap(f => FAM[f]?.[type] || []))];
+  return ids.length ? { with_genres: ids.join('|') } : null;
+}
+const yearsAgo = n => { const d = new Date(); d.setFullYear(d.getFullYear() - n); return d.toISOString().slice(0, 10); };
+const monthsAgo = n => { const d = new Date(); d.setMonth(d.getMonth() - n); return d.toISOString().slice(0, 10); };
 
 /* ---------- Empfehlungen ---------- */
 function recsSignature() {
-  return [...S.items.values()].map(i => `${kOf(i)}:${i.status}:${i.rating || ''}`).sort().join('|');
+  return [...S.items.values()].map(i => `${kOf(i)}:${i.status}:${i.rating || ''}`).sort().join('|') + '#' + hiddenSet().size;
 }
 function getRecs() {
   const sig = recsSignature();
@@ -610,44 +661,326 @@ function getRecs() {
   S.recsPromise = computeRecs().then(r => { if (S.recsPromiseSig === sig) { S.recs = r; S.recsSig = sig; } return r; });
   return S.recsPromise;
 }
-async function computeRecs() {
-  const base = { done: 0.8, watching: 1, planned: 0.5, dropped: -0.7 };
-  const seeds = [...S.items.values()]
-    .map(it => ({ it, w: it.rating ? (it.rating - 5) / 2.5 : base[it.status] ?? 0.4 }))
+function seedList() {
+  return [...S.items.values()]
+    .map(it => ({ it, w: itemWeight(it) * (1 + 0.25 * Math.max(0, 1 - (Date.now() - new Date(it.updated_at || it.added_at || 0)) / 7.8e9)) }))
     .filter(x => x.w !== 0)
     .sort((a, b) => Math.abs(b.w) - Math.abs(a.w) || String(b.it.updated_at).localeCompare(String(a.it.updated_at)))
-    .slice(0, 16);
+    .slice(0, 24);
+}
+async function computeRecs() {
+  const seeds = seedList();
+  const prof = tasteProfile();
+  const hidden = hiddenSet();
   const scores = new Map();
+  const pos = seeds.filter(s => s.w > 0);
   await Promise.all(seeds.map(async ({ it, w }) => {
-    try {
-      const r = await tmdb(`/${it.media_type}/${it.tmdb_id}/recommendations`);
-      (r.results || []).slice(0, 20).forEach((c, i) => {
+    const pages = [tmdb(`/${it.media_type}/${it.tmdb_id}/recommendations`)];
+    if (w > 0 && pos.indexOf(pos.find(s => s.it === it)) < 6) pages.push(tmdb(`/${it.media_type}/${it.tmdb_id}/recommendations`, { page: 2 }));
+    if (w > 0.9) pages.push(tmdb(`/${it.media_type}/${it.tmdb_id}/similar`));
+    const res = await Promise.allSettled(pages);
+    res.forEach((r, pi) => {
+      if (r.status !== 'fulfilled') return;
+      const sim = pi === 2 ? 0.55 : 1;
+      (r.value.results || []).forEach((c, i) => {
         const type = c.media_type || it.media_type;
         if (type !== 'tv' && type !== 'movie') return;
         const k = key(type, c.id);
-        if (S.items.has(k)) return;
-        const s = w * (1 - i / 26) * (c.vote_count > 50 ? 1 : 0.6);
+        if (S.items.has(k) || hidden.has(k)) return;
+        const rank = i + pi * 20;
+        const s = w * sim * (1 - rank / 50);
         let e = scores.get(k);
-        if (!e) { e = { c: { ...c, media_type: type }, score: 0, because: [] }; scores.set(k, e); }
-        e.score += s;
+        if (!e) { e = { c: { ...c, media_type: type }, score: 0, hits: 0, because: [] }; scores.set(k, e); }
+        e.score += s; e.hits++;
         if (s > 0) e.because.push([s, it.title]);
       });
-    } catch {}
+    });
   }));
-  return [...scores.values()]
-    .filter(e => e.score > 0.25 && e.c.poster_path)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 48)
-    .map(e => ({ ...e.c, reason: e.because.sort((a, b) => b[0] - a[0]).slice(0, 2).map(x => x[1]) }));
+  const thisYear = new Date().getFullYear();
+  const ranked = [...scores.values()].filter(e => e.score > 0.2 && e.c.poster_path).map(e => {
+    const c = e.c;
+    const conf = Math.min(1, Math.log10((c.vote_count || 0) + 1) / 3);           // 1000 Stimmen = volle Sicherheit
+    const qual = Math.max(0.35, Math.min(1.25, ((c.vote_average || 5) - 5) / 2.8)) * (0.6 + 0.4 * conf);
+    const fams = famsOf(c);
+    const aff = fams.length ? fams.reduce((a, f) => a + (prof.w.get(f) || 0), 0) / fams.length : 0;
+    const yr = +(year(c) || 0);
+    const fresh = yr >= thisYear - 2 ? 1.08 : yr && yr < thisYear - 25 ? 0.9 : 1;
+    const multi = 1 + 0.12 * Math.min(4, e.hits - 1);                             // von mehreren Titeln empfohlen
+    return { e, s: e.score * qual * (1 + 0.45 * aff) * fresh * multi };
+  }).sort((a, b) => b.s - a.s);
+  // Vielfalt: nicht alles wegen desselben Titels
+  const maxS = ranked[0]?.s || 1;
+  const used = new Map(), out = [];
+  const pool = ranked.slice(0, 160);
+  while (pool.length && out.length < 80) {
+    let bi = 0, bv = -Infinity;
+    for (let i = 0; i < Math.min(pool.length, 40); i++) {
+      const top = pool[i].e.because.sort((a, b) => b[0] - a[0])[0]?.[1];
+      const v = pool[i].s * Math.pow(0.82, used.get(top) || 0);
+      if (v > bv) { bv = v; bi = i; }
+    }
+    const [pick] = pool.splice(bi, 1);
+    const top = pick.e.because[0]?.[1];
+    used.set(top, (used.get(top) || 0) + 1);
+    out.push({ ...pick.e.c, reason: pick.e.because.slice(0, 2).map(x => x[1]), match: Math.round(68 + 30 * Math.sqrt(pick.s / maxS)) });
+  }
+  return out;
 }
 function reasonText(r) { return r?.length ? `Weil du ${r.map(t => `„${t}“`).join(' und ')} auf der Liste hast` : ''; }
 
-async function fillRecs(el, n, row) {
+/* ---------- Reihen ---------- */
+const freshOnly = list => { const h = hiddenSet(); return list.filter(c => c.poster_path && !S.items.has(key(c.media_type, c.id)) && !isHidden(c, h)); };
+const dedupe = list => { const s = new Set(); return list.filter(c => { const k = key(c.media_type, c.id); if (s.has(k)) return false; s.add(k); return true; }); };
+
+function homeRows() {
+  const has = S.items.size > 0;
+  const prof = tasteProfile();
+  const seeds = seedList().filter(s => s.w > 0.5).map(s => s.it);
+  const top3 = prof.top.length ? prof.top.slice(0, 3) : ['crime', 'scifi', 'comedy'];
+  const rows = [];
+  const R = (id, title, sub, load, o = {}) => rows.push({ id, title, sub, load, ...o });
+
+  if (has) R('recs', 'Für dich', 'Ausgewählt nach deiner Liste und deinen Bewertungen', async () => (await getRecs()).slice(0, 24), { personal: true, link: '<a href="#/discover">Alle →</a>', reasons: true });
+  R('top-tv', 'Top 10 Serien heute', 'Am meisten gestreamt in Deutschland', () => disc('tv', { with_watch_monetization_types: 'flatrate', 'vote_count.gte': 30 }).then(l => l.slice(0, 10)), { ranked: true });
+
+  const because = (it, i) => R('bc-' + kOf(it), `Weil du „${esc(it.title)}“ ${it.rating >= 8 ? 'liebst' : it.status === 'watching' ? 'guckst' : 'magst'}`, '',
+    () => Promise.all([tmdb(`/${it.media_type}/${it.tmdb_id}/recommendations`).then(tag(it.media_type)), tmdb(`/${it.media_type}/${it.tmdb_id}/similar`).then(tag(it.media_type)).catch(() => [])])
+      .then(([a, b]) => dedupe([...a, ...b.filter(c => c.vote_count > 100)])), { personal: true, seedBg: it });
+  const genreRow = f => R('g-' + f, `${has ? 'Mehr ' : 'Beliebt: '}${FAM[f].label}`, has ? 'Passt zu dem, was du oft schaust' : '', () => {
+    const tvp = famParams('tv', [f]), mvp = famParams('movie', [f]);
+    const q = { 'vote_average.gte': 6.8, 'vote_count.gte': 250 };
+    return Promise.all([
+      tvp ? disc('tv', { ...tvp, ...q, page: dayPick('tv' + f, 3) }) : [],
+      mvp ? disc('movie', { ...mvp, ...q, page: dayPick('mv' + f, 4) }) : [],
+    ]).then(([a, b]) => interleave(a, b));
+  }, { personal: has });
+
+  if (seeds[0]) because(seeds[0]);
+  R('mine-new', 'Neu bei deinen Diensten', '', async () => {
+    const pv = await myProviders(); if (!pv.length) return [];
+    const ids = pv.map(p => p.id).join('|');
+    const [a, b] = await Promise.all([
+      disc('tv', { with_watch_providers: ids, with_watch_monetization_types: 'flatrate', 'first_air_date.gte': monthsAgo(14), 'vote_count.gte': 20 }),
+      disc('movie', { with_watch_providers: ids, with_watch_monetization_types: 'flatrate', 'primary_release_date.gte': monthsAgo(14), 'vote_count.gte': 40 }),
+    ]);
+    return interleave(a, b);
+  }, { personal: true, provSub: true });
+  genreRow(top3[0]);
+  R('trend', 'Trends diese Woche', 'Worüber gerade alle reden', () => tmdb('/trending/all/week').then(r => r.results.filter(c => c.media_type === 'tv' || c.media_type === 'movie')));
+  if (seeds[1]) because(seeds[1]);
+  if (top3[1]) genreRow(top3[1]);
+  R('acclaimed', 'Hochgelobte Serien', 'Die besten Bewertungen aller Zeiten', () => tmdb('/tv/top_rated', { page: dayPick('acc', 5) }).then(tag('tv')), { personal: true });
+  R('top-mv', 'Top 10 Filme heute', 'Am meisten gestreamt in Deutschland', () => disc('movie', { with_watch_monetization_types: 'flatrate', 'vote_count.gte': 50 }).then(l => l.slice(0, 10)), { ranked: true });
+  if (seeds[2]) because(seeds[2]);
+  R('gems', 'Versteckte Perlen', 'Stark bewertet, aber kaum jemand kennt sie', () => {
+    const q = { sort_by: 'vote_average.desc', 'vote_average.gte': 7.5, 'vote_count.gte': 120, 'vote_count.lte': 1500 };
+    const tvp = famParams('tv', top3) || {}, mvp = famParams('movie', top3) || {};
+    return Promise.all([disc('tv', { ...q, ...tvp, page: dayPick('gt', 3) }), disc('movie', { ...q, ...mvp, page: dayPick('gm', 3) })]).then(([a, b]) => interleave(a, b));
+  }, { personal: true });
+  if (top3[2]) genreRow(top3[2]);
+  R('prov-a', '', '', async () => { const p = (await myProviders())[0]; return p ? provRow(p) : []; }, { provTitle: 0 });
+  if (seeds[3]) because(seeds[3]);
+  R('prov-b', '', '', async () => { const p = (await myProviders())[1]; return p ? provRow(p) : []; }, { provTitle: 1 });
+  R('acclaimed-mv', 'Filmklassiker, die man gesehen haben muss', '', () => tmdb('/movie/top_rated', { page: dayPick('accm', 5) }).then(tag('movie')), { personal: true });
+  R('on-air', 'Neue Folgen diese Woche', 'Serien, die gerade laufen', () => tmdb('/tv/on_the_air').then(tag('tv')).then(l => l.filter(c => c.vote_count > 30)));
+  if (seeds[4]) because(seeds[4]);
+  R('upcoming', 'Bald im Kino', '', () => tmdb('/movie/upcoming', { region: 'DE' }).then(tag('movie')));
+  return rows;
+}
+function provRow(p) {
+  return Promise.all([
+    disc('tv', { with_watch_providers: p.id, with_watch_monetization_types: 'flatrate', page: dayPick('pt' + p.id, 2) }),
+    disc('movie', { with_watch_providers: p.id, with_watch_monetization_types: 'flatrate', page: dayPick('pm' + p.id, 2) }),
+  ]).then(([a, b]) => interleave(a, b));
+}
+
+function rowHTML(r) {
+  const c = S.rows.get(r.id);
+  return `<section class="section" data-row="${r.id}" ${c?.list && !c.list.length ? 'hidden' : ''}>
+    <div class="section-head"><div><h2 data-rt>${r.title || '&nbsp;'}</h2><div class="sub" data-rs>${r.sub || ''}</div></div>${r.link || ''}</div>
+    <div class="row ${r.ranked ? 'ranked' : 'posters'}" data-rl>${c?.list ? rowCards(r, c.list) : skeletons(7)}</div>
+  </section>`;
+}
+function rowCards(r, list) {
+  const shown = (r.personal ? freshOnly(list) : list.filter(c => !isHidden(c))).slice(0, r.ranked ? 10 : 20);
+  if (r.ranked) return shown.map((c, i) => `<div class="rank-card"><span class="big tnum">${i + 1}</span>${posterCard(c)}</div>`).join('');
+  return shown.map(c => posterCard(c, { reason: r.reasons && c.reason?.[0] ? `Wegen „${c.reason[0]}“` : '', match: r.reasons ? c.match : 0 })).join('');
+}
+async function fillRow(sec, r) {
+  if (sec.dataset.loading) return;
+  sec.dataset.loading = '1';
   try {
-    const recs = (await getRecs()).filter(c => !S.items.has(key(c.media_type, c.id))).slice(0, n);
+    let list = S.rows.get(r.id)?.list;
+    if (!list) { list = dedupe(await r.load()); S.rows.set(r.id, { list }); }
+    if (!sec.isConnected) return;
+    if (r.provTitle != null) {
+      const p = (await myProviders())[r.provTitle];
+      if (p) { sec.querySelector('[data-rt]').innerHTML = `<span class="prov-title"><img src="${img(p.l, 'w92')}" alt="">Beliebt bei ${esc(p.n)}</span>`; }
+    }
+    if (r.provSub) {
+      const pv = await myProviders();
+      sec.querySelector('[data-rs]').textContent = pv.length ? pv.map(p => p.n).join(', ') + ' · seit letztem Jahr' : '';
+    }
+    const html = rowCards(r, list);
+    if (!html) { sec.hidden = true; return; }
+    sec.hidden = false;
+    sec.querySelector('[data-rl]').innerHTML = html;
+  } catch (e) {
+    if (sec.isConnected) sec.querySelector('[data-rl]').outerHTML = `<p class="err">${esc(e.message)}</p>`;
+  } finally { delete sec.dataset.loading; }
+}
+let rowObserver = null;
+function observeRows(v, rows) {
+  rowObserver?.disconnect();
+  const byId = new Map(rows.map(r => [r.id, r]));
+  rowObserver = new IntersectionObserver(ents => ents.forEach(en => {
+    if (!en.isIntersecting) return;
+    rowObserver.unobserve(en.target);
+    const r = byId.get(en.target.dataset.row); if (r) fillRow(en.target, r);
+  }), { rootMargin: '900px 0px' });
+  v.querySelectorAll('[data-row]').forEach(sec => {
+    const r = byId.get(sec.dataset.row);
+    if (S.rows.get(r.id)?.list && r.provTitle == null && !r.provSub) return;
+    rowObserver.observe(sec);
+  });
+}
+
+/* ---------- Hero-Karussell ---------- */
+function heroRecHTML(c, i) {
+  const type = c.media_type, id = c.id;
+  const fams = famsOf(c).map(f => FAM[f].label).slice(0, 2);
+  const logo = S.logos.get(key(type, id));
+  const inList = S.items.has(key(type, id));
+  return `<section class="hero" data-slide="${i}" data-bg="${esc(c.backdrop_path || '')}">
+    ${c.backdrop_path ? `<img class="bg" src="${img(c.backdrop_path, 'w1280')}" alt="" ${i ? 'loading="lazy"' : ''}>` : ''}
+    <div class="content">
+      <div class="eyebrow">${c.match ? `<span class="match">${c.match} % Match</span>` : ''}${c.reason?.[0] ? `Wegen „${esc(c.reason[0])}“` : c.heroLabel || 'Neu entdecken'}</div>
+      ${logo ? `<img class="logo-img" src="${img(logo, 'w500')}" alt="${esc(nameOf(c))}">` : `<h1 class="title-fallback" data-logo-for="${type}:${id}">${esc(nameOf(c))}</h1>`}
+      <div class="metaline"><span>${typeLabel(type)}</span>${year(c) ? `<span>${year(c)}</span>` : ''}${fams.length ? `<span>${esc(fams.join(' · '))}</span>` : ''}${c.vote_count > 20 ? `<span><b>★ ${fmtNum(c.vote_average)}</b></span>` : ''}</div>
+      ${c.overview ? `<p class="overview">${esc(c.overview)}</p>` : ''}
+      <div class="actions">${inList ? `<a class="btn primary" href="#/${type}/${id}">${I.check}Auf deiner Liste</a>` : `<button class="btn primary" data-add="${type}:${id}">${I.plus}Auf die Liste</button>`}<a class="btn ghost" href="#/${type}/${id}">${I.info}Details</a></div>
+    </div>
+  </section>`;
+}
+async function heroSlides() {
+  const watching = inStatus('watching'), planned = inStatus('planned');
+  const next = watching[0] || planned[0];
+  let picks = [];
+  try {
+    if (S.items.size) picks = (await getRecs()).filter(c => c.backdrop_path && c.overview).slice(0, 5);
+    if (picks.length < 3) {
+      const tr = (await tmdb('/trending/all/day')).results.filter(c => (c.media_type === 'tv' || c.media_type === 'movie') && c.backdrop_path && c.overview);
+      picks = dedupe([...picks, ...freshOnly(tr).map(c => ({ ...c, heroLabel: 'Heute im Trend' }))]).slice(0, 6);
+    }
+  } catch {}
+  return { next, picks };
+}
+function setAmbient(path) {
+  const a = $('#ambient'); if (!a) return;
+  const src = path ? img(path, 'w300') : '';
+  if (a.dataset.src === src) return;
+  a.dataset.src = src;
+  const el = document.createElement('img');
+  el.alt = ''; el.src = src;
+  el.onload = () => { a.querySelectorAll('img.on').forEach(o => { o.classList.remove('on'); setTimeout(() => o.remove(), 1200); }); requestAnimationFrame(() => el.classList.add('on')); };
+  if (src) a.appendChild(el); else a.querySelectorAll('img').forEach(o => o.classList.remove('on'));
+}
+let heroTimer = null;
+function bindCarousel(box) {
+  const track = box.querySelector('.hc-track');
+  const slides = [...track.children];
+  const dots = [...box.querySelectorAll('.hc-dots button')];
+  const go = (i, smooth = true) => track.scrollTo({ left: i * track.clientWidth, behavior: smooth ? 'smooth' : 'auto' });
+  const cur = () => Math.round(track.scrollLeft / Math.max(1, track.clientWidth));
+  const sync = () => {
+    const i = cur(); S.heroIdx = i;
+    dots.forEach((d, j) => d.setAttribute('aria-current', j === i));
+    setAmbient(slides[i]?.dataset.bg);
+  };
+  if (S.heroIdx && S.heroIdx < slides.length) requestAnimationFrame(() => { go(S.heroIdx, false); sync(); }); else sync();
+  track.addEventListener('scroll', debounce(sync, 80), { passive: true });
+  dots.forEach((d, j) => d.onclick = () => { go(j); restart(); });
+  const restart = () => {
+    clearInterval(heroTimer);
+    if (slides.length < 2 || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    heroTimer = setInterval(() => {
+      if (!box.isConnected) { clearInterval(heroTimer); return; }
+      if (document.hidden || S.detail || box.matches(':hover')) return;
+      go((cur() + 1) % slides.length);
+    }, 7000);
+  };
+  track.addEventListener('pointerdown', restart, { passive: true });
+  restart();
+  // Logos nachladen
+  slides.forEach(async s => {
+    const h = s.querySelector('[data-logo-for]'); if (!h) return;
+    const [type, id] = h.dataset.logoFor.split(':');
+    try {
+      const r = await tmdb(`/${type}/${id}/images`, { include_image_language: 'de,en,null', language: null });
+      const lg = pickLogo(r.logos);
+      S.logos.set(`${type}:${id}`, lg);
+      if (lg && h.isConnected) h.outerHTML = `<img class="logo-img" src="${img(lg, 'w500')}" alt="${esc(h.textContent)}">`;
+    } catch {}
+  });
+}
+
+/* ---------- Start ---------- */
+function renderHome(v) {
+  const all = [...S.items.values()];
+  const watching = inStatus('watching');
+  const planned = inStatus('planned');
+  const sy = window.scrollY;
+  let html = '<div id="hero-slot">' + (S.heroCache ? carouselHTML(S.heroCache) : `<section class="hero skeleton-hero"></section>`) + '</div>';
+  if (watching.length) {
+    html += `<section class="section">${sectionHead('Am Gucken', `${watching.length} Titel`)}
+      <div class="row wide">${watching.map(watchCard).join('')}</div></section>`;
+  }
+  if (planned.length) {
+    html += `<section class="section">${sectionHead('Warteschlange', 'In deiner Reihenfolge', '<a href="#/list">Reihenfolge ändern →</a>')}
+      <div class="row posters">${planned.map((it, i) => posterCard({ ...it, id: it.tmdb_id }, { rank: i + 1 })).join('')}</div></section>`;
+  }
+  if (!all.length) {
+    html += `<section class="panel welcome"><div><div class="eyebrow">Willkommen</div><h2>Was guckst du als Nächstes?</h2>
+      <p>Setz ein paar Serien und Filme auf deine Liste und bewerte, was du gesehen hast – dann wird jede Reihe hier persönlich für dich.</p></div>
+      <a class="btn primary" href="#/discover?suche">${I.search}Titel suchen</a></section>`;
+  }
+  const rows = homeRows();
+  html += rows.map(rowHTML).join('');
+  html += credit();
+  v.innerHTML = html;
+  window.scrollTo(0, sy);
+  observeRows(v, rows);
+  if (S.heroCache) bindCarousel($('#hero-slot .hero-carousel'));
+  const sig = recsSignature();
+  if (S.heroSig !== sig) {
+    S.heroSig = sig;
+    heroSlides().then(h => {
+      S.heroCache = h;
+      const slot = $('#hero-slot');
+      if (!slot || S.curView !== 'home') return;
+      slot.innerHTML = carouselHTML(h);
+      bindCarousel(slot.querySelector('.hero-carousel'));
+    });
+  }
+}
+function carouselHTML({ next, picks }) {
+  const nextIt = next ? S.items.get(kOf(next)) || next : null;
+  const slides = [...(nextIt ? [heroHTML(nextIt).replace('<section class="hero"', `<section class="hero" data-slide="0" data-bg="${esc(nextIt.backdrop_path || '')}"`)] : []),
+    ...picks.filter(c => !nextIt || key(c.media_type, c.id) !== kOf(nextIt)).map((c, i) => heroRecHTML(c, i + (nextIt ? 1 : 0)))];
+  if (!slides.length) return '';
+  return `<div class="hero-carousel"><div class="hc-track">${slides.join('')}</div>
+    ${slides.length > 1 ? `<div class="hc-dots">${slides.map((_, i) => `<button aria-label="Titel ${i + 1}"></button>`).join('')}</div>` : ''}</div>`;
+}
+
+const skeletons = n => Array.from({ length: n }, () => '<div class="pcard"><div class="skeleton" style="aspect-ratio:2/3"></div></div>').join('');
+const credit = () => `<footer class="credit">Daten und Bilder: TMDB. Diese App nutzt die TMDB-API, ist aber nicht von TMDB unterstützt oder zertifiziert. Streaming-Daten: JustWatch.</footer>`;
+
+async function fillRecs(el, n, row, type) {
+  try {
+    const recs = freshOnly(await getRecs()).filter(c => !type || c.media_type === type).slice(0, n);
     if (!el.isConnected) return;
     if (!recs.length) { el.outerHTML = `<div class="empty"><h3>Noch keine Empfehlungen</h3><span>Setz ein paar Titel auf deine Liste oder bewerte, was du gesehen hast.</span></div>`; return; }
-    el.innerHTML = recs.map(c => posterCard(c, { reason: row ? (c.reason?.[0] ? `Wegen „${c.reason[0]}“` : '') : reasonText(c.reason) })).join('');
+    el.innerHTML = recs.map(c => posterCard(c, { reason: row ? (c.reason?.[0] ? `Wegen „${c.reason[0]}“` : '') : reasonText(c.reason), match: c.match })).join('');
   } catch (e) { if (el.isConnected) el.outerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
@@ -727,20 +1060,40 @@ function renumber(status) {
 }
 
 /* ---------- Entdecken ---------- */
+const SORTS = [
+  { id: 'pop', label: 'Beliebt', p: { sort_by: 'popularity.desc' } },
+  { id: 'top', label: 'Top bewertet', p: { sort_by: 'vote_average.desc', 'vote_count.gte': 400 } },
+  { id: 'new', label: 'Neu', p: { sort_by: 'popularity.desc' }, fresh: true },
+];
 function renderDiscover(v, fresh) {
   if (!fresh && $('#q', v)) { updateDiscover(); return; }
   v.innerHTML = `
-  <div class="page-head"><div><h1>Entdecken</h1><p>Suchen, stöbern, auf die Liste setzen.</p></div></div>
+  <div class="page-head"><div><h1>Entdecken</h1><p>Stöbern nach Genre, Anbieter und Laune.</p></div></div>
   <div class="search">${I.search}<input id="q" type="search" placeholder="Serie oder Film suchen …" autocomplete="off" enterkeyhint="search" value="${esc(S.search.q)}" aria-label="Serie oder Film suchen"></div>
+  <div id="disc-filters"></div>
   <div id="disc-results"></div>`;
   $('#q').addEventListener('input', debounce(e => runSearch(e.target.value), 280));
   updateDiscover();
 }
 
+function discFiltersHTML() {
+  const D = S.disc;
+  const fams = FAMS.filter(f => f[D.type].length);
+  return `<div class="disc-bar">
+    <div class="seg-pill" role="group" aria-label="Art">${[['tv', 'Serien'], ['movie', 'Filme']].map(([id, l]) => `<button data-dtype="${id}" aria-pressed="${D.type === id}">${l}</button>`).join('')}</div>
+    ${D.fam ? `<div class="seg-pill small" role="group" aria-label="Sortierung">${SORTS.map(s => `<button data-dsort="${s.id}" aria-pressed="${D.sort === s.id}">${s.label}</button>`).join('')}</div>` : ''}
+  </div>
+  <div class="chips scroll" role="group" aria-label="Genre">
+    <button class="chip" data-dfam="" aria-pressed="${!D.fam}">✦ Für dich</button>
+    ${fams.map(f => `<button class="chip" data-dfam="${f.id}" aria-pressed="${D.fam === f.id}">${f.label}</button>`).join('')}
+  </div>`;
+}
+
 function updateDiscover() {
-  const box = $('#disc-results');
+  const box = $('#disc-results'), fb = $('#disc-filters');
   if (!box) return;
   if (S.search.q.trim()) {
+    fb.innerHTML = '';
     if (S.search.loading && !S.search.results) { box.innerHTML = `<div class="grid">${skeletons(12)}</div>`; return; }
     const res = S.search.results || [];
     box.innerHTML = res.length
@@ -748,22 +1101,51 @@ function updateDiscover() {
       : `<div class="empty"><h3>Nichts gefunden</h3><span>Probier einen anderen Titel oder den Originaltitel.</span></div>`;
     return;
   }
-  box.innerHTML = `
-    <section class="section">${sectionHead('Für dich', S.items.size ? 'Passend zu deiner Liste und deinen Bewertungen' : '')}
-      ${S.items.size ? `<div class="grid" id="disc-recs">${skeletons(12)}</div>` : `<div class="empty"><h3>Empfehlungen folgen</h3><span>Sobald du Titel auf der Liste hast, findest du hier Vorschläge dazu.</span></div>`}</section>
-    <section class="section">${sectionHead('Trends diese Woche')}<div class="row posters" id="disc-trending">${skeletons(7)}</div></section>
-    <section class="section">${sectionHead('Beliebte Serien')}<div class="row posters" id="disc-tv">${skeletons(7)}</div></section>
-    ${credit()}`;
-  if (S.items.size) fillRecs($('#disc-recs'), 36, false);
-  fillTrending($('#disc-trending'));
-  fillList($('#disc-tv'), '/tv/popular', 'tv');
+  fb.innerHTML = discFiltersHTML();
+  fb.querySelectorAll('[data-dtype]').forEach(b => b.onclick = () => { S.disc.type = b.dataset.dtype; if (S.disc.fam && !FAM[S.disc.fam][S.disc.type].length) S.disc.fam = null; resetDisc(); });
+  fb.querySelectorAll('[data-dfam]').forEach(b => b.onclick = () => { S.disc.fam = b.dataset.dfam || null; resetDisc(); });
+  fb.querySelectorAll('[data-dsort]').forEach(b => b.onclick = () => { S.disc.sort = b.dataset.dsort; resetDisc(); });
+  const D = S.disc;
+  if (!D.fam) {
+    const tl = D.type === 'tv' ? 'Serien' : 'Filme';
+    box.innerHTML = `
+      <section class="section">${sectionHead(`${tl} für dich`, S.items.size ? 'Passend zu deiner Liste und deinen Bewertungen' : '')}
+        ${S.items.size ? `<div class="grid" id="disc-recs">${skeletons(12)}</div>` : `<div class="empty"><h3>Empfehlungen folgen</h3><span>Sobald du Titel auf der Liste hast, findest du hier Vorschläge dazu.</span></div>`}</section>
+      <section class="section">${sectionHead(`Beliebte ${tl}`)}<div class="row posters" id="disc-pop">${skeletons(7)}</div></section>
+      <section class="section">${sectionHead(`Trends: ${tl}`)}<div class="row posters" id="disc-trending">${skeletons(7)}</div></section>
+      ${credit()}`;
+    if (S.items.size) fillRecs($('#disc-recs'), 36, false, D.type);
+    fillInto($('#disc-pop'), () => tmdb(`/${D.type}/popular`, { region: 'DE' }).then(tag(D.type)));
+    fillInto($('#disc-trending'), () => tmdb(`/trending/${D.type}/week`).then(tag(D.type)));
+    return;
+  }
+  box.innerHTML = `<section class="section">${sectionHead(FAM[D.fam].label, D.type === 'tv' ? 'Serien' : 'Filme')}
+    <div class="grid" id="disc-grid">${D.results.length ? D.results.map(c => posterCard(c)).join('') : skeletons(12)}</div>
+    <div class="more"><button class="btn" id="disc-more" ${D.done ? 'hidden' : ''}>Mehr laden</button></div></section>${credit()}`;
+  $('#disc-more').onclick = () => loadDiscPage();
+  if (!D.results.length && !D.loading) loadDiscPage();
 }
-
-async function fillList(el, path, type) {
+function resetDisc() { Object.assign(S.disc, { page: 0, results: [], done: false, loading: false, seq: (S.disc.seq || 0) + 1 }); updateDiscover(); }
+async function loadDiscPage() {
+  const D = S.disc; if (D.loading || D.done) return;
+  D.loading = true;
+  const seq = D.seq, sort = SORTS.find(s => s.id === D.sort) || SORTS[0];
+  const btn = $('#disc-more'); if (btn) { btn.disabled = true; btn.textContent = 'Lädt …'; }
   try {
-    const r = await tmdb(path, { region: 'DE' });
-    if (el.isConnected) el.innerHTML = r.results.map(c => posterCard({ ...c, media_type: type })).join('');
-  } catch (e) { if (el.isConnected) el.outerHTML = `<p class="err">${esc(e.message)}</p>`; }
+    const p = { ...famParams(D.type, [D.fam]), ...sort.p, page: D.page + 1 };
+    if (sort.fresh) p[D.type === 'tv' ? 'first_air_date.gte' : 'primary_release_date.gte'] = monthsAgo(18);
+    const r = await tmdb(`/discover/${D.type}`, { watch_region: 'DE', include_adult: 'false', 'vote_count.gte': 40, ...p });
+    if (seq !== D.seq) return;
+    D.page++;
+    D.results = dedupe([...D.results, ...tag(D.type)(r).filter(c => c.poster_path && !isHidden(c))]);
+    D.done = D.page >= Math.min(r.total_pages || 1, 20);
+  } catch (e) { toast(e.message, 'err'); }
+  D.loading = false;
+  if (seq === D.seq && $('#disc-grid')) updateDiscover();
+}
+async function fillInto(el, load) {
+  try { const l = await load(); if (el.isConnected) el.innerHTML = l.filter(c => !isHidden(c)).map(c => posterCard(c)).join(''); }
+  catch (e) { if (el.isConnected) el.outerHTML = `<p class="err">${esc(e.message)}</p>`; }
 }
 
 async function runSearch(q) {
@@ -783,12 +1165,25 @@ async function runSearch(q) {
 /* ---------- Einstellungen ---------- */
 function renderSettings(v) {
   const n = S.items.size;
+  const hid = hiddenSet().size;
+  const lite = lsGet('an_lite') === '1';
   v.innerHTML = `
   <div class="page-head"><div><h1>Einstellungen</h1></div></div>
   <div class="settings">
     <div class="panel">
       <div><div class="label">Konto</div><div>${esc(S.user?.email || '')}</div></div>
       <div class="actions"><button class="btn small" id="sync">Jetzt synchronisieren</button><button class="btn small danger" id="logout">Abmelden</button></div>
+    </div>
+    <div class="panel">
+      <div><div class="label">Meine Streamingdienste</div><div class="hint">Für die Reihen „Neu bei deinen Diensten“ und „Beliebt bei …“. Ohne Auswahl erkennt die App sie aus deiner Liste.</div></div>
+      <div class="prov-pick" id="prov-pick">${skeletons(0)}<div class="skeleton" style="height:96px"></div></div>
+    </div>
+    <div class="panel">
+      <div><div class="label">Empfehlungen</div><div class="tnum">${hid} ${hid === 1 ? 'Titel' : 'Titel'} ausgeblendet („Kein Interesse“)</div></div>
+      <div class="actions"><button class="btn small" id="unhide" ${hid ? '' : 'disabled'}>Wieder anzeigen</button></div>
+    </div>
+    <div class="panel">
+      <label class="switch"><input type="checkbox" id="lite" ${lite ? 'checked' : ''}><span></span><div><b>Effekte reduzieren</b><div class="hint">Weniger Unschärfe und Animation – flüssiger auf älteren Geräten.</div></div></label>
     </div>
     <form class="panel" id="key-form" novalidate>
       <div class="field"><label for="tmdb-key">TMDB-Schlüssel</label><input id="tmdb-key" type="password" autocomplete="off" spellcheck="false" value="${esc(S.tmdbKey || '')}"></div>
@@ -803,6 +1198,8 @@ function renderSettings(v) {
   </div>`;
   $('#logout').onclick = () => S.sb.auth.signOut();
   $('#sync').onclick = async () => { await syncItems(); toast('Synchronisiert'); };
+  $('#unhide').onclick = () => { lsSet(uKey('hide'), '[]'); S.recs = null; S.recsSig = null; S.heroSig = null; S.rows.clear(); toast('Alle Vorschläge werden wieder angezeigt'); renderSettings(v); };
+  $('#lite').onchange = e => { lsSet('an_lite', e.target.checked ? '1' : '0'); document.documentElement.classList.toggle('lite', e.target.checked); };
   $('#export').onclick = () => {
     const blob = new Blob([JSON.stringify([...S.items.values()], null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
@@ -816,6 +1213,26 @@ function renderSettings(v) {
     try { await saveKey($('#tmdb-key').value); toast('Schlüssel gespeichert'); }
     catch (x) { err.textContent = x.message; err.hidden = false; }
   };
+  renderProvPick();
+}
+async function renderProvPick() {
+  const box = $('#prov-pick'); if (!box) return;
+  let cat;
+  try { cat = (await providerCatalog()).slice(0, 30); } catch (e) { box.innerHTML = `<p class="err">${esc(e.message)}</p>`; return; }
+  const mine = new Set((await myProviders()).map(p => p.id));
+  let chosen = null; try { chosen = JSON.parse(lsGet(uKey('prov')) || 'null'); } catch {}
+  if (!box.isConnected) return;
+  box.innerHTML = cat.map(p => `<button type="button" data-prov="${p.id}" aria-pressed="${mine.has(p.id)}" title="${esc(p.n)}"><img src="${img(p.l, 'w92')}" alt="${esc(p.n)}" loading="lazy"><span>${esc(p.n)}</span></button>`).join('')
+    + `<div class="hint" style="grid-column:1/-1">${chosen?.length ? 'Eigene Auswahl' : 'Automatisch erkannt'}${chosen?.length ? ' · <button class="linkbtn" id="prov-auto">Automatisch</button>' : ''}</div>`;
+  box.querySelectorAll('[data-prov]').forEach(b => b.onclick = () => {
+    const id = +b.dataset.prov;
+    const cur = new Set(chosen?.length ? chosen : [...mine]);
+    cur.has(id) ? cur.delete(id) : cur.add(id);
+    lsSet(uKey('prov'), JSON.stringify([...cur]));
+    S.rows.delete('mine-new'); S.rows.delete('prov-a'); S.rows.delete('prov-b');
+    renderProvPick();
+  });
+  const au = $('#prov-auto'); if (au) au.onclick = () => { lsSet(uKey('prov'), 'null'); S.rows.delete('mine-new'); S.rows.delete('prov-a'); S.rows.delete('prov-b'); renderProvPick(); };
 }
 
 /* ---------- Detailansicht ---------- */
@@ -839,6 +1256,7 @@ async function openDetail(type, id) {
   }
   if (!S.detail || S.detail.type !== type || S.detail.id !== id) return;
   S.detail.data = d;
+  setAmbient(d.backdrop_path);
   const it = S.items.get(key(type, id));
   if (it) {
     const fresh = itemFromDetails(type, d);
@@ -857,6 +1275,7 @@ async function openDetail(type, id) {
 function closeDetail() {
   if (!S.detail) return;
   S.detail = null;
+  if (S.curView === 'home' && S.heroCache) { const s = document.querySelectorAll('.hc-track > .hero')[S.heroIdx]; setAmbient(s?.dataset.bg); }
   const r = sheetRoot();
   if (r) r.innerHTML = '';
   document.body.style.overflow = '';
@@ -930,7 +1349,8 @@ function renderDetailActions(trailer) {
   if (trailer !== undefined) D.trailer = trailer;
   const it = detailItem();
   let primary;
-  if (!it) primary = `<button class="btn primary" data-act="add">${I.plus}Auf die Liste</button>`;
+  if (!it) primary = `<button class="btn primary" data-act="add">${I.plus}Auf die Liste</button>`
+    + (hiddenSet().has(key(D.type, D.id)) ? '' : `<button class="btn ghost" data-act="hide">${I.x}Kein Interesse</button>`);
   else if (D.type === 'tv') {
     const st = epStats(it);
     primary = st.next ? `<button class="btn primary" data-act="next-ep" data-key="${kOf(it)}">${I.check}${epLabel(st.next)} gesehen</button>`
@@ -1073,6 +1493,7 @@ function bindDetail() {
     if (!b || !root.contains(b)) return;
     const D = S.detail; if (!D) return;
     if (b.dataset.act === 'close') { leaveDetail(); return; }
+    if (b.dataset.act === 'hide') { hideTitle(key(D.type, D.id)); S.heroSig = null; toast('Wird dir nicht mehr vorgeschlagen'); leaveDetail(); return; }
     if (b.dataset.act === 'add') { ensureDetailItem('planned'); toast('Auf die Liste gesetzt'); refreshDetail(); return; }
     if (b.dataset.act === 'remove') { const it = detailItem(); if (it) removeItem(it); return; }
     if (b.dataset.act === 'to-front') { const it = detailItem(); if (it) { save({ ...it, position: endPos('planned', true) }); toast('Steht jetzt ganz vorne in der Warteschlange'); refreshDetail(); } return; }
@@ -1158,5 +1579,6 @@ document.addEventListener('visibilitychange', () => {
   if (!document.hidden && S.user && S.tmdbKey && Date.now() - S.lastSync > 30000) syncItems();
 });
 
+if (lsGet('an_lite') === '1') document.documentElement.classList.add('lite');
 boot();
 })();

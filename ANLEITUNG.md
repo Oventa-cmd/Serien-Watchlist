@@ -38,12 +38,13 @@
 ## Bedienung
 | Ansicht | Was du dort machst |
 |---|---|
-| Start | Was als Nächstes dran ist, Folge direkt abhaken, Warteschlange, Empfehlungen |
+| Start | Wechselnder Hero (Als Nächstes + Top-Empfehlungen), Am Gucken, Warteschlange und ~20 Reihen: Für dich, „Weil du X magst“, Top 10, deine Genres, Neu bei deinen Diensten, Versteckte Perlen, Hochgelobt, Trends, Neue Folgen, Bald im Kino |
 | Liste | Vier Spalten (Geplant / Am Gucken / Fertig / Abgebrochen), per Griff ⋮⋮ ziehen zum Sortieren |
-| Entdecken | Suche (Taste `/`), Empfehlungen mit Begründung, Trends |
+| Entdecken | Suche (Taste `/`), Serien/Filme, Genre-Chips mit Sortierung (Beliebt/Top/Neu) und „Mehr laden“ |
+| Einstellungen | Eigene Streamingdienste wählen, ausgeblendete Vorschläge zurücksetzen, „Effekte reduzieren“ |
 | Details | Status, Sterne (auch halbe), Notiz, Anbieter in DE, Folgen pro Staffel abhaken |
 
-Empfehlungen basieren auf deiner Liste: Hoch bewertete Titel zählen am meisten, abgebrochene oder schlecht bewertete ziehen ähnliche Vorschläge nach unten.
+Empfehlungen basieren auf deiner Liste: Hoch bewertete Titel zählen am meisten, abgebrochene oder schlecht bewertete ziehen ähnliche Vorschläge nach unten. Zusätzlich fließen dein Genre-Profil, die TMDB-Bewertung und Aktualität ein; Titel, die von mehreren deiner Serien empfohlen werden, steigen nach oben. In der Detailansicht blendet „Kein Interesse“ einen Vorschlag dauerhaft aus.
 
 ## Später etwas ändern
 Dateien im GitHub-Repo ersetzen (Upload überschreibt) – nach 1–2 Minuten ist die neue Version online. Deine Daten bleiben in Supabase.
